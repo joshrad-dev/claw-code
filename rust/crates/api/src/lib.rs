@@ -20,9 +20,12 @@ pub use prompt_cache::{
 };
 pub use providers::anthropic::{AnthropicClient, AnthropicClient as ApiClient, AuthSource};
 pub use providers::openai_compat::{
-    build_chat_completion_request, flatten_tool_result_content, is_reasoning_model,
-    model_rejects_is_error_field, model_requires_reasoning_content_in_history, translate_message,
-    OpenAiCompatClient, OpenAiCompatConfig,
+    begin_codex_device_authorization, build_chat_completion_request, build_responses_request,
+    clear_codex_oauth_credentials, flatten_tool_result_content, is_reasoning_model,
+    load_codex_oauth_credentials, model_rejects_is_error_field,
+    model_requires_reasoning_content_in_history, poll_codex_device_authorization,
+    save_codex_oauth_credentials, translate_message, CodexAuth, CodexDeviceAuthorization,
+    OpenAiApiStyle, OpenAiCompatClient, OpenAiCompatConfig,
 };
 pub use providers::{
     detect_provider_kind, max_tokens_for_model, max_tokens_for_model_with_override,

@@ -24,11 +24,12 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use api::{
-    detect_provider_kind, model_family_identity_for, resolve_startup_auth_source, AnthropicClient,
-    AuthSource, ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest,
-    MessageResponse, OutputContentBlock, PromptCache, ProviderClient as ApiProviderClient,
-    ProviderKind, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
-    ToolResultContentBlock,
+    begin_codex_device_authorization, clear_codex_oauth_credentials, detect_provider_kind,
+    load_codex_oauth_credentials, model_family_identity_for, poll_codex_device_authorization,
+    resolve_startup_auth_source, save_codex_oauth_credentials, AnthropicClient, AuthSource,
+    ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
+    OutputContentBlock, PromptCache, ProviderClient as ApiProviderClient, ProviderKind,
+    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 
 use commands::{
@@ -58,6 +59,7 @@ use tools::{
 };
 
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
+const DEFAULT_CODEX_OAUTH_MODEL: &str = "openai/gpt-5.4-mini";
 
 /// #148: Model provenance for `claw status` JSON/text output. Records where
 /// the resolved model string came from so claws don't have to re-read argv
@@ -144,7 +146,7 @@ impl ModelProvenance {
                 source: ModelSource::Config,
             };
         }
-        Self::default_fallback()
+        default_model_provenance()
     }
 }
 
@@ -405,7 +407,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 None
             };
             let effective_prompt = merge_prompt_with_stdin(&prompt, stdin_context.as_deref());
-            let mut cli = LiveCli::new(model, true, allowed_tools, permission_mode)?;
+            let resolved_model = resolve_repl_model(model);
+            let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
             cli.set_reasoning_effort(reasoning_effort);
             cli.run_turn_with_output(&effective_prompt, output_format, compact)?;
         }
@@ -413,6 +416,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::Acp { output_format } => print_acp_status(output_format)?,
         CliAction::State { output_format } => run_worker_state(output_format)?,
         CliAction::Init { output_format } => run_init(output_format)?,
+        CliAction::Login { provider } => run_login(&provider)?,
+        CliAction::Logout { provider } => run_logout(&provider)?,
         // #146: dispatch pure-local introspection. Text mode uses existing
         // render_config_report/render_diff_report; JSON mode uses the
         // corresponding _json helpers already exposed for resume sessions.
@@ -546,6 +551,12 @@ enum CliAction {
     },
     Init {
         output_format: CliOutputFormat,
+    },
+    Login {
+        provider: String,
+    },
+    Logout {
+        provider: String,
     },
     // #146: `claw config` and `claw diff` are pure-local read-only
     // introspection commands; wire them as standalone CLI subcommands.
@@ -965,7 +976,8 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         }
         "system-prompt" => parse_system_prompt_args(&rest[1..], model, output_format),
         "acp" => parse_acp_args(&rest[1..], output_format),
-        "login" | "logout" => Err(removed_auth_surface_error(rest[0].as_str())),
+        "login" => parse_login_args(&rest[1..]),
+        "logout" => parse_logout_args(&rest[1..]),
         "init" => Ok(CliAction::Init { output_format }),
         "export" => parse_export_args(&rest[1..], output_format),
         "prompt" => {
@@ -1172,8 +1184,32 @@ fn bare_slash_command_guidance(command_name: &str) -> Option<String> {
 
 fn removed_auth_surface_error(command_name: &str) -> String {
     format!(
-        "`claw {command_name}` has been removed. Set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN instead."
+        "`claw {command_name}` for Anthropic auth has been removed. Set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN instead. For Codex OAuth, use `claw {command_name} codex`."
     )
+}
+
+fn parse_login_args(args: &[String]) -> Result<CliAction, String> {
+    match args {
+        [provider] if provider == "codex" => Ok(CliAction::Login {
+            provider: provider.clone(),
+        }),
+        [provider] => Err(format!(
+            "unsupported login provider `{provider}`. Use `claw login codex`."
+        )),
+        _ => Err("usage: claw login codex".to_string()),
+    }
+}
+
+fn parse_logout_args(args: &[String]) -> Result<CliAction, String> {
+    match args {
+        [provider] if provider == "codex" => Ok(CliAction::Logout {
+            provider: provider.clone(),
+        }),
+        [provider] => Err(format!(
+            "unsupported logout provider `{provider}`. Use `claw logout codex`."
+        )),
+        _ => Err("usage: claw logout codex".to_string()),
+    }
 }
 
 fn parse_acp_args(args: &[String], output_format: CliOutputFormat) -> Result<CliAction, String> {
@@ -1616,7 +1652,26 @@ fn resolve_repl_model(cli_model: String) -> String {
     if let Some(config_model) = config_model_for_current_dir() {
         return resolve_model_alias_with_config(&config_model);
     }
+    if codex_oauth_is_configured() {
+        return DEFAULT_CODEX_OAUTH_MODEL.to_string();
+    }
     cli_model
+}
+
+fn codex_oauth_is_configured() -> bool {
+    load_codex_oauth_credentials().ok().flatten().is_some()
+}
+
+fn default_model_provenance() -> ModelProvenance {
+    if codex_oauth_is_configured() {
+        ModelProvenance {
+            resolved: DEFAULT_CODEX_OAUTH_MODEL.to_string(),
+            raw: None,
+            source: ModelSource::Default,
+        }
+    } else {
+        ModelProvenance::default_fallback()
+    }
 }
 
 fn provider_label(kind: ProviderKind) -> &'static str {
@@ -2100,6 +2155,8 @@ fn check_auth_health() -> DiagnosticCheck {
     let auth_token_present = env::var("ANTHROPIC_AUTH_TOKEN")
         .ok()
         .is_some_and(|value| !value.trim().is_empty());
+    let codex_oauth = load_codex_oauth_credentials();
+    let codex_oauth_present = codex_oauth.as_ref().ok().and_then(Option::as_ref).is_some();
     let env_details = format!(
         "Environment       api_key={} auth_token={}",
         if api_key_present { "present" } else { "absent" },
@@ -2109,24 +2166,35 @@ fn check_auth_health() -> DiagnosticCheck {
             "absent"
         }
     );
+    let supported_auth_present = api_key_present || auth_token_present || codex_oauth_present;
+    let codex_detail = match &codex_oauth {
+        Ok(Some(auth)) => Some(format!(
+            "Codex OAuth      access_token=present refresh_token=present account_id={}",
+            auth.account_id.as_deref().unwrap_or("<none>")
+        )),
+        Ok(None) => Some("Codex OAuth      absent".to_string()),
+        Err(error) => Some(format!("Codex OAuth      error={error}")),
+    };
 
     match load_oauth_credentials() {
         Ok(Some(token_set)) => DiagnosticCheck::new(
             "Auth",
-            if api_key_present || auth_token_present {
+            if supported_auth_present {
                 DiagnosticLevel::Ok
             } else {
                 DiagnosticLevel::Warn
             },
             if api_key_present || auth_token_present {
                 "supported auth env vars are configured; legacy saved OAuth is ignored"
+            } else if codex_oauth_present {
+                "Codex OAuth credentials are configured; legacy saved OAuth is ignored"
             } else {
                 "legacy saved OAuth credentials are present but unsupported"
             },
         )
-        .with_details(vec![
-            env_details,
-            format!(
+        .with_details({
+            let mut details = vec![env_details];
+            details.push(format!(
                 "Legacy OAuth      expires_at={} refresh_token={} scopes={}",
                 token_set
                     .expires_at
@@ -2141,13 +2209,30 @@ fn check_auth_health() -> DiagnosticCheck {
                 } else {
                     token_set.scopes.join(",")
                 }
-            ),
-            "Suggested action  set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN; `claw login` is removed"
-                .to_string(),
-        ])
+            ));
+            if !supported_auth_present {
+                details.push(
+                    "Suggested action  set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN, or run `claw login codex`"
+                        .to_string(),
+                );
+            }
+            if let Some(detail) = codex_detail.clone() {
+                details.push(detail);
+            }
+            details
+        })
         .with_data(Map::from_iter([
             ("api_key_present".to_string(), json!(api_key_present)),
             ("auth_token_present".to_string(), json!(auth_token_present)),
+            ("codex_oauth_present".to_string(), json!(codex_oauth_present)),
+            (
+                "codex_account_id".to_string(),
+                json!(codex_oauth
+                    .as_ref()
+                    .ok()
+                    .and_then(Option::as_ref)
+                    .and_then(|auth| auth.account_id.as_deref())),
+            ),
             ("legacy_saved_oauth_present".to_string(), json!(true)),
             (
                 "legacy_saved_oauth_expires_at".to_string(),
@@ -2161,21 +2246,38 @@ fn check_auth_health() -> DiagnosticCheck {
         ])),
         Ok(None) => DiagnosticCheck::new(
             "Auth",
-            if api_key_present || auth_token_present {
+            if supported_auth_present {
                 DiagnosticLevel::Ok
             } else {
                 DiagnosticLevel::Warn
             },
             if api_key_present || auth_token_present {
                 "supported auth env vars are configured"
+            } else if codex_oauth_present {
+                "Codex OAuth credentials are configured"
             } else {
                 "no supported auth env vars were found"
             },
         )
-        .with_details(vec![env_details])
+        .with_details({
+            let mut details = vec![env_details];
+            if let Some(detail) = codex_detail.clone() {
+                details.push(detail);
+            }
+            details
+        })
         .with_data(Map::from_iter([
             ("api_key_present".to_string(), json!(api_key_present)),
             ("auth_token_present".to_string(), json!(auth_token_present)),
+            ("codex_oauth_present".to_string(), json!(codex_oauth_present)),
+            (
+                "codex_account_id".to_string(),
+                json!(codex_oauth
+                    .as_ref()
+                    .ok()
+                    .and_then(Option::as_ref)
+                    .and_then(|auth| auth.account_id.as_deref())),
+            ),
             ("legacy_saved_oauth_present".to_string(), json!(false)),
             ("legacy_saved_oauth_expires_at".to_string(), Value::Null),
             ("legacy_refresh_token_present".to_string(), json!(false)),
@@ -2189,6 +2291,7 @@ fn check_auth_health() -> DiagnosticCheck {
         .with_data(Map::from_iter([
             ("api_key_present".to_string(), json!(api_key_present)),
             ("auth_token_present".to_string(), json!(auth_token_present)),
+            ("codex_oauth_present".to_string(), json!(codex_oauth_present)),
             ("legacy_saved_oauth_present".to_string(), Value::Null),
             ("legacy_saved_oauth_expires_at".to_string(), Value::Null),
             ("legacy_refresh_token_present".to_string(), Value::Null),
@@ -6061,6 +6164,42 @@ fn print_sandbox_status_snapshot(
     Ok(())
 }
 
+fn run_login(provider: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if provider != "codex" {
+        return Err(format!("unsupported login provider `{provider}`").into());
+    }
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(async {
+        let authorization = begin_codex_device_authorization().await?;
+        println!("Codex OAuth");
+        println!("  Open  {}", authorization.verification_url);
+        println!("  Code  {}", authorization.user_code);
+        println!("Waiting for authorization...");
+        let started = Instant::now();
+        let timeout = Duration::from_secs(5 * 60);
+        loop {
+            if let Some(auth) = poll_codex_device_authorization(&authorization).await? {
+                save_codex_oauth_credentials(&auth)?;
+                println!("Codex OAuth saved to Claw credentials.");
+                return Ok::<(), Box<dyn std::error::Error>>(());
+            }
+            if started.elapsed() >= timeout {
+                return Err("Codex OAuth timed out before authorization completed".into());
+            }
+            tokio::time::sleep(Duration::from_secs(authorization.interval_seconds + 3)).await;
+        }
+    })
+}
+
+fn run_logout(provider: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if provider != "codex" {
+        return Err(format!("unsupported logout provider `{provider}`").into());
+    }
+    clear_codex_oauth_credentials()?;
+    println!("Removed Codex OAuth credentials from Claw credentials.");
+    Ok(())
+}
+
 fn sandbox_json_value(status: &runtime::SandboxStatus) -> serde_json::Value {
     json!({
         "kind": "sandbox",
@@ -9324,6 +9463,12 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "  claw skills")?;
     writeln!(out, "  claw system-prompt [--cwd PATH] [--date YYYY-MM-DD]")?;
     writeln!(out, "  claw init")?;
+    writeln!(out, "  claw login codex")?;
+    writeln!(
+        out,
+        "      Sign in to ChatGPT Pro/Plus for Codex models; stores credentials in Claw"
+    )?;
+    writeln!(out, "  claw logout codex")?;
     writeln!(
         out,
         "  claw export [PATH] [--session SESSION] [--output PATH]"
@@ -9462,7 +9607,7 @@ mod tests {
         CliOutputFormat, CliToolExecutor, GitWorkspaceSummary, InternalPromptProgressEvent,
         InternalPromptProgressState, LiveCli, LocalHelpTopic, PromptHistoryEntry,
         SessionLifecycleKind, SessionLifecycleSummary, SlashCommand, StatusUsage, TmuxPaneSnapshot,
-        DEFAULT_MODEL, LATEST_SESSION_REFERENCE, STUB_COMMANDS,
+        DEFAULT_CODEX_OAUTH_MODEL, DEFAULT_MODEL, LATEST_SESSION_REFERENCE, STUB_COMMANDS,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
@@ -10334,11 +10479,25 @@ mod tests {
     }
 
     #[test]
-    fn removed_login_and_logout_subcommands_error_helpfully() {
-        let login = parse_args(&["login".to_string()]).expect_err("login should be removed");
-        assert!(login.contains("ANTHROPIC_API_KEY"));
-        let logout = parse_args(&["logout".to_string()]).expect_err("logout should be removed");
-        assert!(logout.contains("ANTHROPIC_AUTH_TOKEN"));
+    fn login_and_logout_support_codex_oauth_only() {
+        assert_eq!(
+            parse_args(&["login".to_string(), "codex".to_string()])
+                .expect("codex login should parse"),
+            CliAction::Login {
+                provider: "codex".to_string(),
+            }
+        );
+        assert_eq!(
+            parse_args(&["logout".to_string(), "codex".to_string()])
+                .expect("codex logout should parse"),
+            CliAction::Logout {
+                provider: "codex".to_string(),
+            }
+        );
+        let login = parse_args(&["login".to_string()]).expect_err("login requires provider");
+        assert!(login.contains("claw login codex"));
+        let logout = parse_args(&["logout".to_string()]).expect_err("logout requires provider");
+        assert!(logout.contains("claw logout codex"));
         assert_eq!(
             parse_args(&["doctor".to_string()]).expect("doctor should parse"),
             CliAction::Doctor {
@@ -12016,6 +12175,29 @@ mod tests {
     }
 
     #[test]
+    fn resolve_repl_model_uses_codex_oauth_default_when_configured() {
+        let _guard = env_lock();
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("root dir");
+        let config_home = root.join("config");
+        fs::create_dir_all(&config_home).expect("config home dir");
+        fs::write(
+            config_home.join("credentials.json"),
+            r#"{"codex_oauth":{"access_token":"codex-access","refresh_token":"codex-refresh"}}"#,
+        )
+        .expect("credentials write");
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        std::env::remove_var("ANTHROPIC_MODEL");
+
+        let resolved = with_current_dir(&root, || resolve_repl_model(DEFAULT_MODEL.to_string()));
+
+        assert_eq!(resolved, DEFAULT_CODEX_OAUTH_MODEL);
+
+        std::env::remove_var("CLAW_CONFIG_HOME");
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
     fn resume_supported_command_list_matches_expected_surface() {
         let names = resume_supported_slash_commands()
             .into_iter()
@@ -12106,8 +12288,8 @@ mod tests {
         assert!(help.contains("claw /skills"));
         assert!(help.contains("ultraworkers/claw-code"));
         assert!(help.contains("cargo install claw-code"));
-        assert!(!help.contains("claw login"));
-        assert!(!help.contains("claw logout"));
+        assert!(help.contains("claw login codex"));
+        assert!(help.contains("claw logout codex"));
     }
 
     #[test]

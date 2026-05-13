@@ -1,8 +1,10 @@
 use std::collections::{BTreeMap, VecDeque};
+use std::fs;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::error::ApiError;
@@ -19,6 +21,14 @@ use super::{preflight_message_request, Provider, ProviderFuture};
 pub const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 pub const DEFAULT_DASHSCOPE_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
+pub const CODEX_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
+const OPENAI_OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+const OPENAI_DEVICE_USER_CODE_URL: &str =
+    "https://auth.openai.com/api/accounts/deviceauth/usercode";
+const OPENAI_DEVICE_TOKEN_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/token";
+const OPENAI_DEVICE_VERIFICATION_URL: &str = "https://auth.openai.com/codex/device";
+const OPENAI_DEVICE_REDIRECT_URI: &str = "https://auth.openai.com/deviceauth/callback";
+const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const REQUEST_ID_HEADER: &str = "request-id";
 const ALT_REQUEST_ID_HEADER: &str = "x-request-id";
 const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
@@ -31,11 +41,19 @@ pub struct OpenAiCompatConfig {
     pub api_key_env: &'static str,
     pub base_url_env: &'static str,
     pub default_base_url: &'static str,
+    pub api_style: OpenAiApiStyle,
     /// Maximum request body size in bytes. Provider-specific limits:
     /// - `DashScope`: 6MB (`6_291_456` bytes) - observed in dogfood testing
     /// - `OpenAI`: 100MB (`104_857_600` bytes)
     /// - `xAI`: 50MB (`52_428_800` bytes)
     pub max_request_body_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OpenAiApiStyle {
+    #[default]
+    ChatCompletions,
+    Responses,
 }
 
 const XAI_ENV_VARS: &[&str] = &["XAI_API_KEY"];
@@ -55,6 +73,7 @@ impl OpenAiCompatConfig {
             api_key_env: "XAI_API_KEY",
             base_url_env: "XAI_BASE_URL",
             default_base_url: DEFAULT_XAI_BASE_URL,
+            api_style: OpenAiApiStyle::ChatCompletions,
             max_request_body_bytes: XAI_MAX_REQUEST_BODY_BYTES,
         }
     }
@@ -66,6 +85,31 @@ impl OpenAiCompatConfig {
             api_key_env: "OPENAI_API_KEY",
             base_url_env: "OPENAI_BASE_URL",
             default_base_url: DEFAULT_OPENAI_BASE_URL,
+            api_style: OpenAiApiStyle::ChatCompletions,
+            max_request_body_bytes: OPENAI_MAX_REQUEST_BODY_BYTES,
+        }
+    }
+
+    #[must_use]
+    pub const fn openai_responses() -> Self {
+        Self {
+            provider_name: "OpenAI",
+            api_key_env: "OPENAI_API_KEY",
+            base_url_env: "OPENAI_BASE_URL",
+            default_base_url: DEFAULT_OPENAI_BASE_URL,
+            api_style: OpenAiApiStyle::Responses,
+            max_request_body_bytes: OPENAI_MAX_REQUEST_BODY_BYTES,
+        }
+    }
+
+    #[must_use]
+    pub const fn codex_oauth() -> Self {
+        Self {
+            provider_name: "Codex",
+            api_key_env: "OPENAI_API_KEY",
+            base_url_env: "CODEX_RESPONSES_URL",
+            default_base_url: CODEX_RESPONSES_URL,
+            api_style: OpenAiApiStyle::Responses,
             max_request_body_bytes: OPENAI_MAX_REQUEST_BODY_BYTES,
         }
     }
@@ -81,6 +125,7 @@ impl OpenAiCompatConfig {
             api_key_env: "DASHSCOPE_API_KEY",
             base_url_env: "DASHSCOPE_BASE_URL",
             default_base_url: DEFAULT_DASHSCOPE_BASE_URL,
+            api_style: OpenAiApiStyle::ChatCompletions,
             max_request_body_bytes: DASHSCOPE_MAX_REQUEST_BODY_BYTES,
         }
     }
@@ -91,15 +136,49 @@ impl OpenAiCompatConfig {
             "xAI" => XAI_ENV_VARS,
             "OpenAI" => OPENAI_ENV_VARS,
             "DashScope" => DASHSCOPE_ENV_VARS,
+            "Codex" => &[".claw/credentials.json codex_oauth"],
             _ => &[],
         }
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OpenAiAuth {
+    ApiKey(String),
+    CodexOAuth(CodexAuth),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexAuth {
+    pub access_token: String,
+    pub refresh_token: String,
+    pub account_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexDeviceAuthorization {
+    pub device_auth_id: String,
+    pub user_code: String,
+    pub interval_seconds: u64,
+    pub verification_url: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct CodexAuthTokens {
+    access_token: String,
+    refresh_token: String,
+    #[serde(default)]
+    account_id: Option<String>,
+    #[serde(default)]
+    id_token: Option<String>,
+    #[serde(flatten)]
+    extra: BTreeMap<String, Value>,
+}
+
 #[derive(Debug, Clone)]
 pub struct OpenAiCompatClient {
     http: reqwest::Client,
-    api_key: String,
+    auth: OpenAiAuth,
     config: OpenAiCompatConfig,
     base_url: String,
     max_retries: u32,
@@ -120,7 +199,7 @@ impl OpenAiCompatClient {
     pub fn new(api_key: impl Into<String>, config: OpenAiCompatConfig) -> Self {
         Self {
             http: build_http_client_or_default(),
-            api_key: api_key.into(),
+            auth: OpenAiAuth::ApiKey(api_key.into()),
             config,
             base_url: read_base_url(config),
             max_retries: DEFAULT_MAX_RETRIES,
@@ -129,14 +208,35 @@ impl OpenAiCompatClient {
         }
     }
 
-    pub fn from_env(config: OpenAiCompatConfig) -> Result<Self, ApiError> {
+    pub fn from_env(mut config: OpenAiCompatConfig) -> Result<Self, ApiError> {
+        if matches!(config.provider_name, "OpenAI") && openai_responses_requested(config) {
+            config = OpenAiCompatConfig::openai_responses();
+        }
         let Some(api_key) = read_env_non_empty(config.api_key_env)? else {
+            if matches!(config.provider_name, "OpenAI") {
+                if let Some(codex_auth) = load_codex_oauth_credentials()? {
+                    return Ok(Self::from_codex_auth(codex_auth));
+                }
+            }
             return Err(ApiError::missing_credentials(
                 config.provider_name,
                 config.credential_env_vars(),
             ));
         };
         Ok(Self::new(api_key, config))
+    }
+
+    #[must_use]
+    pub fn from_codex_auth(auth: CodexAuth) -> Self {
+        Self {
+            http: build_http_client_or_default(),
+            auth: OpenAiAuth::CodexOAuth(auth),
+            config: OpenAiCompatConfig::codex_oauth(),
+            base_url: read_base_url(OpenAiCompatConfig::codex_oauth()),
+            max_retries: DEFAULT_MAX_RETRIES,
+            initial_backoff: DEFAULT_INITIAL_BACKOFF,
+            max_backoff: DEFAULT_MAX_BACKOFF,
+        }
     }
 
     #[must_use]
@@ -203,10 +303,32 @@ impl OpenAiCompatClient {
                 });
             }
         }
-        let payload = serde_json::from_str::<ChatCompletionResponse>(&body).map_err(|error| {
-            ApiError::json_deserialize(self.config.provider_name, &request.model, &body, error)
-        })?;
-        let mut normalized = normalize_response(&request.model, payload)?;
+        let mut normalized = match self.config.api_style {
+            OpenAiApiStyle::ChatCompletions => {
+                let payload =
+                    serde_json::from_str::<ChatCompletionResponse>(&body).map_err(|error| {
+                        ApiError::json_deserialize(
+                            self.config.provider_name,
+                            &request.model,
+                            &body,
+                            error,
+                        )
+                    })?;
+                normalize_response(&request.model, payload)?
+            }
+            OpenAiApiStyle::Responses => {
+                let payload =
+                    serde_json::from_str::<ResponsesResponse>(&body).map_err(|error| {
+                        ApiError::json_deserialize(
+                            self.config.provider_name,
+                            &request.model,
+                            &body,
+                            error,
+                        )
+                    })?;
+                normalize_responses_response(&request.model, payload)
+            }
+        };
         if normalized.request_id.is_none() {
             normalized.request_id = request_id;
         }
@@ -224,7 +346,11 @@ impl OpenAiCompatClient {
         Ok(MessageStream {
             request_id: request_id_from_headers(response.headers()),
             response,
-            parser: OpenAiSseParser::with_context(self.config.provider_name, request.model.clone()),
+            parser: OpenAiSseParser::with_context(
+                self.config.provider_name,
+                request.model.clone(),
+                self.config.api_style,
+            ),
             pending: VecDeque::new(),
             done: false,
             state: StreamState::new(request.model.clone()),
@@ -269,15 +395,43 @@ impl OpenAiCompatClient {
         // Pre-flight check: verify request body size against provider limits
         check_request_body_size(request, self.config())?;
 
-        let request_url = chat_completions_endpoint(&self.base_url);
-        self.http
+        let request_url = endpoint_for_style(&self.base_url, self.config.api_style);
+        let mut request_builder = self
+            .http
             .post(&request_url)
             .header("content-type", "application/json")
-            .bearer_auth(&self.api_key)
-            .json(&build_chat_completion_request(request, self.config()))
-            .send()
-            .await
-            .map_err(ApiError::from)
+            .json(&build_request_payload(request, self.config()));
+        request_builder = self.apply_auth(request_builder).await?;
+        request_builder.send().await.map_err(ApiError::from)
+    }
+
+    async fn apply_auth(
+        &self,
+        request_builder: reqwest::RequestBuilder,
+    ) -> Result<reqwest::RequestBuilder, ApiError> {
+        match &self.auth {
+            OpenAiAuth::ApiKey(api_key) => Ok(request_builder.bearer_auth(api_key)),
+            OpenAiAuth::CodexOAuth(auth) => {
+                let auth = self.refresh_codex_auth_if_needed(auth).await?;
+                let mut request_builder = request_builder.bearer_auth(&auth.access_token);
+                if let Some(account_id) = auth.account_id.as_ref().filter(|value| !value.is_empty())
+                {
+                    request_builder = request_builder.header("ChatGPT-Account-Id", account_id);
+                }
+                Ok(request_builder
+                    .header("originator", "claw")
+                    .header("User-Agent", "claw-code/0.1"))
+            }
+        }
+    }
+
+    async fn refresh_codex_auth_if_needed(&self, auth: &CodexAuth) -> Result<CodexAuth, ApiError> {
+        if !jwt_is_expired_or_near_expiry(&auth.access_token, 60) {
+            return Ok(auth.clone());
+        }
+        let refreshed = refresh_codex_oauth_token(&self.http, auth).await?;
+        save_codex_oauth_credentials(&refreshed)?;
+        Ok(refreshed)
     }
 
     fn backoff_for_attempt(&self, attempt: u32) -> Result<Duration, ApiError> {
@@ -407,29 +561,43 @@ struct OpenAiSseParser {
     buffer: Vec<u8>,
     provider: String,
     model: String,
+    api_style: OpenAiApiStyle,
 }
 
 impl OpenAiSseParser {
-    fn with_context(provider: impl Into<String>, model: impl Into<String>) -> Self {
+    fn with_context(
+        provider: impl Into<String>,
+        model: impl Into<String>,
+        api_style: OpenAiApiStyle,
+    ) -> Self {
         Self {
             buffer: Vec::new(),
             provider: provider.into(),
             model: model.into(),
+            api_style,
         }
     }
 
-    fn push(&mut self, chunk: &[u8]) -> Result<Vec<ChatCompletionChunk>, ApiError> {
+    fn push(&mut self, chunk: &[u8]) -> Result<Vec<ProviderStreamChunk>, ApiError> {
         self.buffer.extend_from_slice(chunk);
         let mut events = Vec::new();
 
         while let Some(frame) = next_sse_frame(&mut self.buffer) {
-            if let Some(event) = parse_sse_frame(&frame, &self.provider, &self.model)? {
+            if let Some(event) =
+                parse_sse_frame(&frame, &self.provider, &self.model, self.api_style)?
+            {
                 events.push(event);
             }
         }
 
         Ok(events)
     }
+}
+
+#[derive(Debug)]
+enum ProviderStreamChunk {
+    Chat(ChatCompletionChunk),
+    Responses(Box<ResponsesStreamEvent>),
 }
 
 #[allow(clippy::struct_excessive_bools)]
@@ -463,7 +631,18 @@ impl StreamState {
         }
     }
 
-    fn ingest_chunk(&mut self, chunk: ChatCompletionChunk) -> Result<Vec<StreamEvent>, ApiError> {
+    fn ingest_chunk(&mut self, chunk: ProviderStreamChunk) -> Result<Vec<StreamEvent>, ApiError> {
+        match chunk {
+            ProviderStreamChunk::Chat(chunk) => self.ingest_chat_chunk(chunk),
+            ProviderStreamChunk::Responses(event) => self.ingest_responses_event(*event),
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn ingest_chat_chunk(
+        &mut self,
+        chunk: ChatCompletionChunk,
+    ) -> Result<Vec<StreamEvent>, ApiError> {
         let mut events = Vec::new();
         if !self.message_started {
             self.message_started = true;
@@ -578,6 +757,163 @@ impl StreamState {
             }
         }
 
+        Ok(events)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn ingest_responses_event(
+        &mut self,
+        event: ResponsesStreamEvent,
+    ) -> Result<Vec<StreamEvent>, ApiError> {
+        let mut events = Vec::new();
+        match event.event_type.as_str() {
+            "response.created" | "response.in_progress" => {
+                if !self.message_started {
+                    self.message_started = true;
+                    let response = event.response;
+                    events.push(StreamEvent::MessageStart(MessageStartEvent {
+                        message: MessageResponse {
+                            id: response
+                                .as_ref()
+                                .map_or_else(|| "response".to_string(), |value| value.id.clone()),
+                            kind: "message".to_string(),
+                            role: "assistant".to_string(),
+                            content: Vec::new(),
+                            model: response
+                                .and_then(|value| value.model)
+                                .unwrap_or_else(|| self.model.clone()),
+                            stop_reason: None,
+                            stop_sequence: None,
+                            usage: Usage::default(),
+                            request_id: None,
+                        },
+                    }));
+                }
+            }
+            "response.output_text.delta" => {
+                if !self.message_started {
+                    events.extend(self.ingest_responses_event(ResponsesStreamEvent {
+                        event_type: "response.created".to_string(),
+                        response: None,
+                        item: None,
+                        item_id: None,
+                        output_index: None,
+                        delta: None,
+                        arguments: None,
+                        name: None,
+                    })?);
+                }
+                let Some(delta) = event.delta.filter(|value| !value.is_empty()) else {
+                    return Ok(events);
+                };
+                if !self.text_started {
+                    self.text_started = true;
+                    events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+                        index: self.text_block_index(),
+                        content_block: OutputContentBlock::Text {
+                            text: String::new(),
+                        },
+                    }));
+                }
+                events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+                    index: self.text_block_index(),
+                    delta: ContentBlockDelta::TextDelta { text: delta },
+                }));
+            }
+            "response.output_text.done" => {
+                if self.text_started && !self.text_finished {
+                    self.text_finished = true;
+                    events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
+                        index: self.text_block_index(),
+                    }));
+                }
+            }
+            "response.output_item.added" => {
+                if let Some(item) = event.item {
+                    if item.item_type == "function_call" {
+                        let index = event.output_index.unwrap_or(0);
+                        let offset = self.tool_index_offset();
+                        let state = self.tool_calls.entry(index).or_default();
+                        state.openai_index = index;
+                        state.id = item.call_id.or(item.id);
+                        state.name = item.name;
+                        state.arguments = item.arguments.unwrap_or_default();
+                        if let Some(start_event) = state.start_event(offset)? {
+                            state.started = true;
+                            events.push(StreamEvent::ContentBlockStart(start_event));
+                        }
+                    }
+                }
+            }
+            "response.function_call_arguments.delta" => {
+                let index = event.output_index.unwrap_or(0);
+                let offset = self.tool_index_offset();
+                let state = self.tool_calls.entry(index).or_default();
+                state.openai_index = index;
+                if let Some(item_id) = event.item_id {
+                    state.id.get_or_insert(item_id);
+                }
+                if let Some(name) = event.name {
+                    state.name.get_or_insert(name);
+                }
+                if let Some(delta) = event.delta {
+                    state.arguments.push_str(&delta);
+                }
+                if !state.started {
+                    if let Some(start_event) = state.start_event(offset)? {
+                        state.started = true;
+                        events.push(StreamEvent::ContentBlockStart(start_event));
+                    }
+                }
+                if let Some(delta_event) = state.delta_event(offset) {
+                    events.push(StreamEvent::ContentBlockDelta(delta_event));
+                }
+            }
+            "response.function_call_arguments.done" => {
+                let index = event.output_index.unwrap_or(0);
+                let offset = self.tool_index_offset();
+                let state = self.tool_calls.entry(index).or_default();
+                state.openai_index = index;
+                if let Some(item_id) = event.item_id {
+                    state.id.get_or_insert(item_id);
+                }
+                if let Some(name) = event.name {
+                    state.name.get_or_insert(name);
+                }
+                if let Some(arguments) = event.arguments {
+                    state.arguments = arguments;
+                }
+                if !state.started {
+                    if let Some(start_event) = state.start_event(offset)? {
+                        state.started = true;
+                        events.push(StreamEvent::ContentBlockStart(start_event));
+                    }
+                }
+                if let Some(delta_event) = state.delta_event(offset) {
+                    events.push(StreamEvent::ContentBlockDelta(delta_event));
+                }
+                if state.started && !state.stopped {
+                    state.stopped = true;
+                    events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
+                        index: state.block_index(offset),
+                    }));
+                }
+            }
+            "response.completed" => {
+                if let Some(response) = event.response {
+                    if let Some(usage) = response.usage {
+                        self.usage = Some(Usage {
+                            input_tokens: usage.input_tokens,
+                            cache_creation_input_tokens: 0,
+                            cache_read_input_tokens: 0,
+                            output_tokens: usage.output_tokens,
+                        });
+                    }
+                    self.stop_reason = Some("end_turn".to_string());
+                }
+            }
+            _ => {}
+        }
         Ok(events)
     }
 
@@ -831,6 +1167,80 @@ struct ErrorBody {
     message: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ResponsesResponse {
+    id: String,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    output: Vec<ResponsesOutputItem>,
+    #[serde(default)]
+    usage: Option<ResponsesUsage>,
+    #[serde(default)]
+    status: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponsesOutputItem {
+    #[serde(rename = "type")]
+    item_type: String,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    call_id: Option<String>,
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
+    content: Vec<ResponsesContentPart>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponsesContentPart {
+    #[serde(rename = "type")]
+    part_type: String,
+    #[serde(default)]
+    text: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponsesUsage {
+    #[serde(default)]
+    input_tokens: u32,
+    #[serde(default)]
+    output_tokens: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponsesStreamEvent {
+    #[serde(rename = "type")]
+    event_type: String,
+    #[serde(default)]
+    response: Option<ResponsesResponse>,
+    #[serde(default)]
+    item: Option<ResponsesOutputItem>,
+    #[serde(default)]
+    item_id: Option<String>,
+    #[serde(default)]
+    output_index: Option<u32>,
+    #[serde(default)]
+    delta: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+fn build_request_payload(request: &MessageRequest, config: OpenAiCompatConfig) -> Value {
+    match config.api_style {
+        OpenAiApiStyle::ChatCompletions => build_chat_completion_request(request, config),
+        OpenAiApiStyle::Responses => build_responses_request(request, config),
+    }
+}
+
 /// Returns true for models known to reject tuning parameters like temperature,
 /// `top_p`, `frequency_penalty`, and `presence_penalty`. These are typically
 /// reasoning/chain-of-thought models with fixed sampling.
@@ -855,7 +1265,7 @@ pub fn is_reasoning_model(model: &str) -> bool {
         || canonical.contains("thinking")
 }
 
-/// Returns true for OpenAI-compatible DeepSeek V4 models that require prior
+/// Returns true for OpenAI-compatible `DeepSeek` V4 models that require prior
 /// assistant reasoning to be echoed back as `reasoning_content` in history.
 #[must_use]
 pub fn model_requires_reasoning_content_in_history(model: &str) -> bool {
@@ -885,7 +1295,7 @@ fn strip_routing_prefix(model: &str) -> &str {
 /// Estimate the serialized JSON size of a request payload in bytes.
 /// This is a pre-flight check to avoid hitting provider-specific size limits.
 pub fn estimate_request_body_size(request: &MessageRequest, config: OpenAiCompatConfig) -> usize {
-    let payload = build_chat_completion_request(request, config);
+    let payload = build_request_payload(request, config);
     // serde_json::to_vec gives us the exact byte size of the serialized JSON
     serde_json::to_vec(&payload).map_or(0, |v| v.len())
 }
@@ -997,6 +1407,119 @@ pub fn build_chat_completion_request(
     payload
 }
 
+/// Builds an `OpenAI` Responses API payload from the normalized message request.
+#[must_use]
+pub fn build_responses_request(request: &MessageRequest, config: OpenAiCompatConfig) -> Value {
+    let wire_model = strip_routing_prefix(&request.model);
+    let instructions = request
+        .system
+        .as_ref()
+        .filter(|value| !value.is_empty())
+        .map_or_else(|| "You are a helpful assistant.".to_string(), Clone::clone);
+    let mut input = Vec::new();
+    for message in &request.messages {
+        input.extend(translate_responses_message(message));
+    }
+
+    let mut payload = json!({
+        "model": wire_model,
+        "input": input,
+        "instructions": instructions,
+        "stream": request.stream,
+        "store": false,
+    });
+    if config.provider_name != "Codex" {
+        payload["max_output_tokens"] = json!(request.max_tokens);
+    }
+
+    if let Some(tools) = &request.tools {
+        payload["tools"] = Value::Array(
+            tools
+                .iter()
+                .map(responses_tool_definition)
+                .collect::<Vec<_>>(),
+        );
+    }
+    if let Some(tool_choice) = &request.tool_choice {
+        payload["tool_choice"] = responses_tool_choice(tool_choice);
+    }
+    if !is_reasoning_model(&request.model) {
+        if let Some(temperature) = request.temperature {
+            payload["temperature"] = json!(temperature);
+        }
+        if let Some(top_p) = request.top_p {
+            payload["top_p"] = json!(top_p);
+        }
+    }
+    if let Some(effort) = &request.reasoning_effort {
+        payload["reasoning"] = json!({ "effort": effort });
+    }
+    if let Some(stop) = &request.stop {
+        if !stop.is_empty() {
+            payload["text"] = json!({ "format": { "type": "text" } });
+        }
+    }
+
+    payload
+}
+
+fn translate_responses_message(message: &InputMessage) -> Vec<Value> {
+    match message.role.as_str() {
+        "assistant" => {
+            let mut content = Vec::new();
+            let mut items = Vec::new();
+            for block in &message.content {
+                match block {
+                    InputContentBlock::Text { text } => {
+                        content.push(json!({"type": "output_text", "text": text}));
+                    }
+                    InputContentBlock::ToolUse { id, name, input } => {
+                        items.push(json!({
+                            "type": "function_call",
+                            "call_id": id,
+                            "name": name,
+                            "arguments": input.to_string(),
+                        }));
+                    }
+                    InputContentBlock::Thinking { .. } | InputContentBlock::ToolResult { .. } => {}
+                }
+            }
+            if !content.is_empty() {
+                items.insert(
+                    0,
+                    json!({
+                        "type": "message",
+                        "role": "assistant",
+                        "content": content,
+                    }),
+                );
+            }
+            items
+        }
+        _ => message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                InputContentBlock::Text { text } => Some(json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": text}],
+                })),
+                InputContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } => Some(json!({
+                    "type": "function_call_output",
+                    "call_id": tool_use_id,
+                    "output": flatten_tool_result_content(content),
+                })),
+                InputContentBlock::Thinking { .. } | InputContentBlock::ToolUse { .. } => None,
+            })
+            .collect(),
+    }
+}
+
 /// Returns true for models that do NOT support the `is_error` field in tool results.
 /// kimi models (via Moonshot AI/Dashscope) reject this field with 400 Bad Request.
 /// Returns true for models that do NOT support the `is_error` field in tool results.
@@ -1083,8 +1606,7 @@ pub fn translate_message(message: &InputMessage, model: &str) -> Vec<Value> {
                     }
                     Some(msg)
                 }
-                InputContentBlock::Thinking { .. } => None,
-                InputContentBlock::ToolUse { .. } => None,
+                InputContentBlock::Thinking { .. } | InputContentBlock::ToolUse { .. } => None,
             })
             .collect(),
     }
@@ -1223,6 +1745,34 @@ fn normalize_object_schema(schema: &mut Value) {
     }
 }
 
+fn normalize_strict_object_schema(schema: &mut Value) {
+    normalize_object_schema(schema);
+    if let Some(obj) = schema.as_object_mut() {
+        obj.remove("format");
+        if obj.get("properties").is_some() && obj.get("type").is_none() {
+            obj.insert("type".to_string(), Value::String("object".to_string()));
+        }
+        if obj.get("type").and_then(Value::as_str) == Some("object") {
+            obj.entry("properties").or_insert_with(|| json!({}));
+            obj.insert("additionalProperties".to_string(), Value::Bool(false));
+            if let Some(properties) = obj.get("properties").and_then(Value::as_object) {
+                obj.insert(
+                    "required".to_string(),
+                    Value::Array(properties.keys().cloned().map(Value::String).collect()),
+                );
+            }
+        }
+        if let Some(props) = obj.get_mut("properties").and_then(Value::as_object_mut) {
+            for value in props.values_mut() {
+                normalize_strict_object_schema(value);
+            }
+        }
+        if let Some(items) = obj.get_mut("items") {
+            normalize_strict_object_schema(items);
+        }
+    }
+}
+
 fn openai_tool_definition(tool: &ToolDefinition) -> Value {
     let mut parameters = tool.input_schema.clone();
     normalize_object_schema(&mut parameters);
@@ -1236,6 +1786,18 @@ fn openai_tool_definition(tool: &ToolDefinition) -> Value {
     })
 }
 
+fn responses_tool_definition(tool: &ToolDefinition) -> Value {
+    let mut parameters = tool.input_schema.clone();
+    normalize_strict_object_schema(&mut parameters);
+    json!({
+        "type": "function",
+        "name": tool.name,
+        "description": tool.description,
+        "parameters": parameters,
+        "strict": true,
+    })
+}
+
 fn openai_tool_choice(tool_choice: &ToolChoice) -> Value {
     match tool_choice {
         ToolChoice::Auto => Value::String("auto".to_string()),
@@ -1243,6 +1805,17 @@ fn openai_tool_choice(tool_choice: &ToolChoice) -> Value {
         ToolChoice::Tool { name } => json!({
             "type": "function",
             "function": { "name": name },
+        }),
+    }
+}
+
+fn responses_tool_choice(tool_choice: &ToolChoice) -> Value {
+    match tool_choice {
+        ToolChoice::Auto => Value::String("auto".to_string()),
+        ToolChoice::Any => Value::String("required".to_string()),
+        ToolChoice::Tool { name } => json!({
+            "type": "function",
+            "name": name,
         }),
     }
 }
@@ -1310,6 +1883,70 @@ fn normalize_response(
     })
 }
 
+fn normalize_responses_response(model: &str, response: ResponsesResponse) -> MessageResponse {
+    let mut content = Vec::new();
+    let mut role = "assistant".to_string();
+    for item in response.output {
+        match item.item_type.as_str() {
+            "message" => {
+                if let Some(item_role) = item.role {
+                    role = item_role;
+                }
+                for part in item.content {
+                    if matches!(part.part_type.as_str(), "output_text" | "text") {
+                        if let Some(text) = part.text.filter(|value| !value.is_empty()) {
+                            content.push(OutputContentBlock::Text { text });
+                        }
+                    }
+                }
+            }
+            "function_call" => {
+                if let (Some(name), Some(arguments)) = (item.name, item.arguments) {
+                    content.push(OutputContentBlock::ToolUse {
+                        id: item
+                            .call_id
+                            .or(item.id)
+                            .unwrap_or_else(|| "function_call".to_string()),
+                        name,
+                        input: parse_tool_arguments(&arguments),
+                    });
+                }
+            }
+            "reasoning" => {
+                content.push(OutputContentBlock::Thinking {
+                    thinking: String::new(),
+                    signature: None,
+                });
+            }
+            _ => {}
+        }
+    }
+    let usage = response.usage.unwrap_or(ResponsesUsage {
+        input_tokens: 0,
+        output_tokens: 0,
+    });
+    MessageResponse {
+        id: response.id,
+        kind: "message".to_string(),
+        role,
+        content,
+        model: response.model.unwrap_or_else(|| model.to_string()),
+        stop_reason: Some(if response.status.as_deref() == Some("incomplete") {
+            "max_tokens".to_string()
+        } else {
+            "end_turn".to_string()
+        }),
+        stop_sequence: None,
+        usage: Usage {
+            input_tokens: usage.input_tokens,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            output_tokens: usage.output_tokens,
+        },
+        request_id: None,
+    }
+}
+
 fn parse_tool_arguments(arguments: &str) -> Value {
     serde_json::from_str(arguments).unwrap_or_else(|_| json!({ "raw": arguments }))
 }
@@ -1336,7 +1973,8 @@ fn parse_sse_frame(
     frame: &str,
     provider: &str,
     model: &str,
-) -> Result<Option<ChatCompletionChunk>, ApiError> {
+    api_style: OpenAiApiStyle,
+) -> Result<Option<ProviderStreamChunk>, ApiError> {
     let trimmed = frame.trim();
     if trimmed.is_empty() {
         return Ok(None);
@@ -1388,9 +2026,14 @@ fn parse_sse_frame(
             });
         }
     }
-    serde_json::from_str::<ChatCompletionChunk>(&payload)
-        .map(Some)
-        .map_err(|error| ApiError::json_deserialize(provider, model, &payload, error))
+    match api_style {
+        OpenAiApiStyle::ChatCompletions => serde_json::from_str::<ChatCompletionChunk>(&payload)
+            .map(|chunk| Some(ProviderStreamChunk::Chat(chunk)))
+            .map_err(|error| ApiError::json_deserialize(provider, model, &payload, error)),
+        OpenAiApiStyle::Responses => serde_json::from_str::<ResponsesStreamEvent>(&payload)
+            .map(|event| Some(ProviderStreamChunk::Responses(Box::new(event))))
+            .map_err(|error| ApiError::json_deserialize(provider, model, &payload, error)),
+    }
 }
 
 fn read_env_non_empty(key: &str) -> Result<Option<String>, ApiError> {
@@ -1399,6 +2042,316 @@ fn read_env_non_empty(key: &str) -> Result<Option<String>, ApiError> {
         Ok(_) | Err(std::env::VarError::NotPresent) => Ok(super::dotenv_value(key)),
         Err(error) => Err(ApiError::from(error)),
     }
+}
+
+pub fn load_codex_oauth_credentials() -> Result<Option<CodexAuth>, ApiError> {
+    let path = claw_credentials_path()?;
+    let root = read_credentials_root(&path)?;
+    let Some(value) = root.get("codex_oauth") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let tokens = serde_json::from_value::<CodexAuthTokens>(value.clone()).map_err(|error| {
+        ApiError::json_deserialize("Codex OAuth", "n/a", &value.to_string(), error)
+    })?;
+    Ok(Some(CodexAuth {
+        access_token: tokens.access_token,
+        refresh_token: tokens.refresh_token,
+        account_id: tokens.account_id,
+    }))
+}
+
+pub fn save_codex_oauth_credentials(auth: &CodexAuth) -> Result<(), ApiError> {
+    let path = claw_credentials_path()?;
+    let mut root = read_credentials_root(&path)?;
+    root.insert(
+        "codex_oauth".to_string(),
+        serde_json::to_value(CodexAuthTokens {
+            access_token: auth.access_token.clone(),
+            refresh_token: auth.refresh_token.clone(),
+            account_id: auth.account_id.clone(),
+            id_token: None,
+            extra: BTreeMap::new(),
+        })
+        .map_err(|error| ApiError::json_deserialize("Codex OAuth", "n/a", "{}", error))?,
+    );
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(ApiError::from)?;
+    }
+    let rendered = serde_json::to_string_pretty(&Value::Object(root))
+        .map_err(|error| ApiError::json_deserialize("Codex OAuth", "n/a", "{}", error))?;
+    fs::write(path, format!("{rendered}\n")).map_err(ApiError::from)
+}
+
+pub fn clear_codex_oauth_credentials() -> Result<(), ApiError> {
+    let path = claw_credentials_path()?;
+    let mut root = read_credentials_root(&path)?;
+    root.remove("codex_oauth");
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(ApiError::from)?;
+    }
+    let rendered = serde_json::to_string_pretty(&Value::Object(root))
+        .map_err(|error| ApiError::json_deserialize("Codex OAuth", "n/a", "{}", error))?;
+    fs::write(path, format!("{rendered}\n")).map_err(ApiError::from)
+}
+
+fn claw_credentials_path() -> Result<PathBuf, ApiError> {
+    let base = std::env::var_os("CLAW_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".claw")))
+        .ok_or_else(|| {
+            ApiError::Auth("HOME is not set; cannot locate Claw credentials".to_string())
+        })?;
+    Ok(base.join("credentials.json"))
+}
+
+fn read_credentials_root(path: &PathBuf) -> Result<serde_json::Map<String, Value>, ApiError> {
+    match fs::read_to_string(path) {
+        Ok(contents) if contents.trim().is_empty() => Ok(serde_json::Map::new()),
+        Ok(contents) => serde_json::from_str::<Value>(&contents)
+            .map_err(|error| ApiError::json_deserialize("Codex OAuth", "n/a", &contents, error))?
+            .as_object()
+            .cloned()
+            .ok_or_else(|| {
+                ApiError::Auth("Claw credentials file must contain a JSON object".to_string())
+            }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(serde_json::Map::new()),
+        Err(error) => Err(ApiError::from(error)),
+    }
+}
+
+async fn refresh_codex_oauth_token(
+    http: &reqwest::Client,
+    auth: &CodexAuth,
+) -> Result<CodexAuth, ApiError> {
+    let response = http
+        .post(OPENAI_OAUTH_TOKEN_URL)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .form(&BTreeMap::from([
+            ("grant_type", "refresh_token"),
+            ("refresh_token", auth.refresh_token.as_str()),
+            ("client_id", CODEX_CLIENT_ID),
+        ]))
+        .send()
+        .await
+        .map_err(ApiError::from)?;
+    let response = expect_success(response).await?;
+    let body = response.text().await.map_err(ApiError::from)?;
+    let token = serde_json::from_str::<CodexTokenResponse>(&body)
+        .map_err(|error| ApiError::json_deserialize("Codex OAuth", "n/a", &body, error))?;
+    let account_id = token.account_id.or_else(|| {
+        token
+            .id_token
+            .as_deref()
+            .and_then(extract_account_id_from_jwt)
+            .or_else(|| extract_account_id_from_jwt(&token.access_token))
+            .or_else(|| auth.account_id.clone())
+    });
+    Ok(CodexAuth {
+        access_token: token.access_token,
+        refresh_token: token
+            .refresh_token
+            .unwrap_or_else(|| auth.refresh_token.clone()),
+        account_id,
+    })
+}
+
+pub async fn begin_codex_device_authorization() -> Result<CodexDeviceAuthorization, ApiError> {
+    let http = build_http_client_or_default();
+    let response = http
+        .post(OPENAI_DEVICE_USER_CODE_URL)
+        .header("content-type", "application/json")
+        .json(&json!({ "client_id": CODEX_CLIENT_ID }))
+        .send()
+        .await
+        .map_err(ApiError::from)?;
+    let response = expect_success(response).await?;
+    let body = response.text().await.map_err(ApiError::from)?;
+    let raw = serde_json::from_str::<CodexDeviceAuthorizationResponse>(&body)
+        .map_err(|error| ApiError::json_deserialize("Codex OAuth device", "n/a", &body, error))?;
+    let interval_seconds = raw.interval_seconds();
+    Ok(CodexDeviceAuthorization {
+        device_auth_id: raw.device_auth_id,
+        user_code: raw.user_code,
+        interval_seconds,
+        verification_url: OPENAI_DEVICE_VERIFICATION_URL.to_string(),
+    })
+}
+
+pub async fn poll_codex_device_authorization(
+    authorization: &CodexDeviceAuthorization,
+) -> Result<Option<CodexAuth>, ApiError> {
+    let http = build_http_client_or_default();
+    let response = http
+        .post(OPENAI_DEVICE_TOKEN_URL)
+        .header("content-type", "application/json")
+        .json(&json!({
+            "device_auth_id": authorization.device_auth_id,
+            "user_code": authorization.user_code,
+        }))
+        .send()
+        .await
+        .map_err(ApiError::from)?;
+    if matches!(
+        response.status(),
+        reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::NOT_FOUND
+    ) {
+        return Ok(None);
+    }
+    let response = expect_success(response).await?;
+    let body = response.text().await.map_err(ApiError::from)?;
+    let device_token = serde_json::from_str::<CodexDeviceTokenResponse>(&body)
+        .map_err(|error| ApiError::json_deserialize("Codex OAuth device", "n/a", &body, error))?;
+    let token = exchange_codex_authorization_code(
+        &http,
+        &device_token.authorization_code,
+        &device_token.code_verifier,
+        OPENAI_DEVICE_REDIRECT_URI,
+    )
+    .await?;
+    let account_id = token.account_id.or_else(|| {
+        token
+            .id_token
+            .as_deref()
+            .and_then(extract_account_id_from_jwt)
+            .or_else(|| extract_account_id_from_jwt(&token.access_token))
+    });
+    Ok(Some(CodexAuth {
+        access_token: token.access_token,
+        refresh_token: token.refresh_token.ok_or_else(|| {
+            ApiError::Auth("Codex OAuth response did not include a refresh token".to_string())
+        })?,
+        account_id,
+    }))
+}
+
+async fn exchange_codex_authorization_code(
+    http: &reqwest::Client,
+    code: &str,
+    code_verifier: &str,
+    redirect_uri: &str,
+) -> Result<CodexTokenResponse, ApiError> {
+    let response = http
+        .post(OPENAI_OAUTH_TOKEN_URL)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .form(&BTreeMap::from([
+            ("grant_type", "authorization_code"),
+            ("code", code),
+            ("redirect_uri", redirect_uri),
+            ("client_id", CODEX_CLIENT_ID),
+            ("code_verifier", code_verifier),
+        ]))
+        .send()
+        .await
+        .map_err(ApiError::from)?;
+    let response = expect_success(response).await?;
+    let body = response.text().await.map_err(ApiError::from)?;
+    serde_json::from_str::<CodexTokenResponse>(&body)
+        .map_err(|error| ApiError::json_deserialize("Codex OAuth", "n/a", &body, error))
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexDeviceAuthorizationResponse {
+    device_auth_id: String,
+    user_code: String,
+    interval: Value,
+}
+
+impl CodexDeviceAuthorizationResponse {
+    fn interval_seconds(&self) -> u64 {
+        self.interval
+            .as_u64()
+            .or_else(|| self.interval.as_str().and_then(|value| value.parse().ok()))
+            .unwrap_or(5)
+            .max(1)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexDeviceTokenResponse {
+    authorization_code: String,
+    code_verifier: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexTokenResponse {
+    access_token: String,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    account_id: Option<String>,
+    #[serde(default)]
+    id_token: Option<String>,
+}
+
+fn jwt_is_expired_or_near_expiry(token: &str, margin_seconds: u64) -> bool {
+    let Some(exp) = jwt_exp(token) else {
+        return false;
+    };
+    exp <= now_unix_timestamp().saturating_add(margin_seconds)
+}
+
+fn jwt_exp(token: &str) -> Option<u64> {
+    let payload = token.split('.').nth(1)?;
+    let decoded = base64url_decode(payload).ok()?;
+    let value = serde_json::from_slice::<Value>(&decoded).ok()?;
+    value.get("exp").and_then(Value::as_u64)
+}
+
+fn extract_account_id_from_jwt(token: &str) -> Option<String> {
+    let payload = token.split('.').nth(1)?;
+    let decoded = base64url_decode(payload).ok()?;
+    let value = serde_json::from_slice::<Value>(&decoded).ok()?;
+    value
+        .get("chatgpt_account_id")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            value
+                .get("https://api.openai.com/auth")
+                .and_then(|auth| auth.get("chatgpt_account_id"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            value
+                .get("organizations")
+                .and_then(Value::as_array)
+                .and_then(|organizations| organizations.first())
+                .and_then(|organization| organization.get("id"))
+                .and_then(Value::as_str)
+        })
+        .map(ToOwned::to_owned)
+}
+
+fn base64url_decode(value: &str) -> Result<Vec<u8>, String> {
+    let mut output = Vec::new();
+    let mut buffer = 0_u32;
+    let mut bits = 0_u8;
+    for byte in value.bytes() {
+        let val = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'-' => 62,
+            b'_' => 63,
+            b'=' => break,
+            _ => return Err(format!("invalid base64url byte: {byte}")),
+        };
+        buffer = (buffer << 6) | u32::from(val);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            output.push(((buffer >> bits) & 0xFF) as u8);
+        }
+    }
+    Ok(output)
+}
+
+fn now_unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
 }
 
 #[must_use]
@@ -1414,12 +2367,34 @@ pub fn read_base_url(config: OpenAiCompatConfig) -> String {
     std::env::var(config.base_url_env).unwrap_or_else(|_| config.default_base_url.to_string())
 }
 
+fn openai_responses_requested(config: OpenAiCompatConfig) -> bool {
+    std::env::var("OPENAI_API_STYLE").is_ok_and(|value| value.eq_ignore_ascii_case("responses"))
+        || std::env::var(config.base_url_env)
+            .is_ok_and(|value| value.trim_end_matches('/').ends_with("/responses"))
+}
+
 fn chat_completions_endpoint(base_url: &str) -> String {
     let trimmed = base_url.trim_end_matches('/');
     if trimmed.ends_with("/chat/completions") {
         trimmed.to_string()
     } else {
         format!("{trimmed}/chat/completions")
+    }
+}
+
+fn responses_endpoint(base_url: &str) -> String {
+    let trimmed = base_url.trim_end_matches('/');
+    if trimmed.ends_with("/responses") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/responses")
+    }
+}
+
+fn endpoint_for_style(base_url: &str, api_style: OpenAiApiStyle) -> String {
+    match api_style {
+        OpenAiApiStyle::ChatCompletions => chat_completions_endpoint(base_url),
+        OpenAiApiStyle::Responses => responses_endpoint(base_url),
     }
 }
 
@@ -1666,35 +2641,39 @@ mod tests {
         // Given streaming chunks with reasoning_content followed by text.
         let mut state = StreamState::new("deepseek-v4-pro".to_string());
         let mut events = state
-            .ingest_chunk(super::ChatCompletionChunk {
-                id: "chatcmpl_stream_reasoning".to_string(),
-                model: Some("deepseek-v4-pro".to_string()),
-                choices: vec![super::ChunkChoice {
-                    delta: super::ChunkDelta {
-                        content: None,
-                        reasoning_content: Some("think".to_string()),
-                        tool_calls: Vec::new(),
-                    },
-                    finish_reason: None,
-                }],
-                usage: None,
-            })
+            .ingest_chunk(super::ProviderStreamChunk::Chat(
+                super::ChatCompletionChunk {
+                    id: "chatcmpl_stream_reasoning".to_string(),
+                    model: Some("deepseek-v4-pro".to_string()),
+                    choices: vec![super::ChunkChoice {
+                        delta: super::ChunkDelta {
+                            content: None,
+                            reasoning_content: Some("think".to_string()),
+                            tool_calls: Vec::new(),
+                        },
+                        finish_reason: None,
+                    }],
+                    usage: None,
+                },
+            ))
             .expect("reasoning chunk");
         events.extend(
             state
-                .ingest_chunk(super::ChatCompletionChunk {
-                    id: "chatcmpl_stream_reasoning".to_string(),
-                    model: None,
-                    choices: vec![super::ChunkChoice {
-                        delta: super::ChunkDelta {
-                            content: Some(" answer".to_string()),
-                            reasoning_content: None,
-                            tool_calls: Vec::new(),
-                        },
-                        finish_reason: Some("stop".to_string()),
-                    }],
-                    usage: None,
-                })
+                .ingest_chunk(super::ProviderStreamChunk::Chat(
+                    super::ChatCompletionChunk {
+                        id: "chatcmpl_stream_reasoning".to_string(),
+                        model: None,
+                        choices: vec![super::ChunkChoice {
+                            delta: super::ChunkDelta {
+                                content: Some(" answer".to_string()),
+                                reasoning_content: None,
+                                tool_calls: Vec::new(),
+                            },
+                            finish_reason: Some("stop".to_string()),
+                        }],
+                        usage: None,
+                    },
+                ))
                 .expect("text chunk"),
         );
         events.extend(state.finish().expect("finish"));

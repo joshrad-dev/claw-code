@@ -353,6 +353,120 @@ async fn openai_streaming_requests_opt_into_usage_chunks() {
     assert_eq!(body["stream_options"], json!({"include_usage": true}));
 }
 
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn openai_responses_mode_uses_responses_endpoint_and_shape() {
+    let _lock = env_lock();
+
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let body = concat!(
+        "{",
+        "\"id\":\"resp_test\",",
+        "\"model\":\"gpt-5\",",
+        "\"status\":\"completed\",",
+        "\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hello from responses\"}]}],",
+        "\"usage\":{\"input_tokens\":12,\"output_tokens\":4}",
+        "}"
+    );
+    let server = spawn_server(
+        state.clone(),
+        vec![http_response("200 OK", "application/json", body)],
+    )
+    .await;
+
+    let client = OpenAiCompatClient::new("openai-test-key", OpenAiCompatConfig::openai_responses())
+        .with_base_url(server.base_url());
+    let response = client
+        .send_message(&MessageRequest {
+            model: "openai/gpt-5".to_string(),
+            ..sample_request(false)
+        })
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.id, "resp_test");
+    assert_eq!(response.total_tokens(), 16);
+    assert_eq!(
+        response.content,
+        vec![OutputContentBlock::Text {
+            text: "Hello from responses".to_string(),
+        }]
+    );
+
+    let captured = state.lock().await;
+    let request = captured.first().expect("captured request");
+    assert_eq!(request.path, "/responses");
+    assert_eq!(
+        request.headers.get("authorization").map(String::as_str),
+        Some("Bearer openai-test-key")
+    );
+    let body: serde_json::Value = serde_json::from_str(&request.body).expect("json body");
+    assert_eq!(body["model"], json!("gpt-5"));
+    assert_eq!(body["input"][0]["type"], json!("message"));
+    assert_eq!(body["max_output_tokens"], json!(64));
+    assert!(body.get("messages").is_none());
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn provider_client_uses_claw_owned_codex_oauth_when_openai_key_is_absent() {
+    let _lock = env_lock();
+    let config_home = temp_config_home();
+    let _config_home = ScopedEnvVar::set("CLAW_CONFIG_HOME", config_home.as_os_str());
+    let _api_key = ScopedEnvVar::unset("OPENAI_API_KEY");
+
+    std::fs::create_dir_all(&config_home).expect("create config home");
+    std::fs::write(
+        config_home.join("credentials.json"),
+        r#"{"codex_oauth":{"access_token":"codex-access","refresh_token":"codex-refresh","account_id":"acct_123"}}"#,
+    )
+    .expect("write credentials");
+
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let body = concat!(
+        "{",
+        "\"id\":\"resp_codex\",",
+        "\"model\":\"gpt-5\",",
+        "\"status\":\"completed\",",
+        "\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Codex OAuth works\"}]}],",
+        "\"usage\":{\"input_tokens\":3,\"output_tokens\":2}",
+        "}"
+    );
+    let server = spawn_server(
+        state.clone(),
+        vec![http_response("200 OK", "application/json", body)],
+    )
+    .await;
+    let _codex_url = ScopedEnvVar::set("CODEX_RESPONSES_URL", server.base_url());
+
+    let client = ProviderClient::from_model("openai/gpt-5").expect("client from saved codex auth");
+    let response = client
+        .send_message(&MessageRequest {
+            model: "openai/gpt-5".to_string(),
+            ..sample_request(false)
+        })
+        .await
+        .expect("provider-dispatched request should succeed");
+
+    assert_eq!(response.total_tokens(), 5);
+    let captured = state.lock().await;
+    let request = captured.first().expect("captured request");
+    assert_eq!(request.path, "/responses");
+    assert_eq!(
+        request.headers.get("authorization").map(String::as_str),
+        Some("Bearer codex-access")
+    );
+    assert_eq!(
+        request
+            .headers
+            .get("chatgpt-account-id")
+            .map(String::as_str),
+        Some("acct_123")
+    );
+
+    std::fs::remove_dir_all(config_home).expect("cleanup temp config home");
+}
+
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn provider_client_dispatches_xai_requests_from_env() {
@@ -563,6 +677,12 @@ impl ScopedEnvVar {
         std::env::set_var(key, value);
         Self { key, previous }
     }
+
+    fn unset(key: &'static str) -> Self {
+        let previous = std::env::var_os(key);
+        std::env::remove_var(key);
+        Self { key, previous }
+    }
 }
 
 impl Drop for ScopedEnvVar {
@@ -572,4 +692,15 @@ impl Drop for ScopedEnvVar {
             None => std::env::remove_var(self.key),
         }
     }
+}
+
+fn temp_config_home() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "api-codex-oauth-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ))
 }
